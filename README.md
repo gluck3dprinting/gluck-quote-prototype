@@ -11,7 +11,7 @@
 
 배포 완료 후 다음 URL에서 접근 가능합니다:
 
-**https://[사용자명].github.io/gluck-quote-prototype/**
+**https://gluck3dprinting.github.io/gluck-quote-prototype/**
 
 > 위 URL의 `[사용자명]` 부분을 본인 GitHub 사용자명으로 교체해주세요.
 
