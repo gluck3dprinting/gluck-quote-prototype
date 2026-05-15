@@ -432,6 +432,7 @@ function getRiskMessages(analysis) {
 function ModelViewer({ part, viewMode, showReferenceCube, onAnalysisUpdate }) {
   const containerRef = useRef(null);
   const stateRef = useRef({});
+  // v26: XYZ 축은 항상 고정 표시 (토글 제거)
 
   useEffect(() => {
     if (!containerRef.current || !part?.file) return;
@@ -445,7 +446,54 @@ function ModelViewer({ part, viewMode, showReferenceCube, onAnalysisUpdate }) {
     const renderer = new THREE.WebGLRenderer({ alpha: true, antialias: true });
     renderer.setPixelRatio(window.devicePixelRatio);
     renderer.setSize(container.clientWidth, container.clientHeight);
+    renderer.autoClear = false;   // v25: 메인 + gizmo 2단 렌더링을 위해
     container.appendChild(renderer.domElement);
+
+    // ═══════════════════════════════════════════════════════════
+    // v25: XYZ Axes Gizmo (좌측 하단 모서리에 작게 표시)
+    // ═══════════════════════════════════════════════════════════
+    // 별도 scene + camera + 작은 viewport로 메인 모델과 절대 겹치지 않게 분리.
+    // 메인 카메라의 방향(회전)만 따라가고 위치는 고정.
+    // 색상: X=Red, Y=Green, Z=Blue (3D 산업 표준)
+    const gizmoScene = new THREE.Scene();
+    const gizmoCamera = new THREE.OrthographicCamera(-1.5, 1.5, 1.5, -1.5, 0.1, 100);
+    gizmoCamera.position.set(0, 0, 5);
+    gizmoCamera.lookAt(0, 0, 0);
+
+    // AxesHelper — Three.js 내장. 단 색상은 X(R) Y(G) Z(B) 표준
+    const gizmoAxes = new THREE.AxesHelper(1.0);
+    // AxesHelper 기본 색상이 이미 X=red, Y=green, Z=blue 표준
+    gizmoScene.add(gizmoAxes);
+
+    // 각 축 끝에 X/Y/Z 라벨 (canvas texture sprite)
+    const makeAxisLabel = (text, color) => {
+      const canvas = document.createElement('canvas');
+      canvas.width = 64;
+      canvas.height = 64;
+      const ctx = canvas.getContext('2d');
+      ctx.fillStyle = color;
+      ctx.font = 'bold 48px sans-serif';
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.fillText(text, 32, 32);
+      const texture = new THREE.CanvasTexture(canvas);
+      texture.minFilter = THREE.LinearFilter;
+      const material = new THREE.SpriteMaterial({ map: texture, transparent: true });
+      const sprite = new THREE.Sprite(material);
+      sprite.scale.set(0.4, 0.4, 0.4);
+      return sprite;
+    };
+
+    const labelX = makeAxisLabel('X', '#ef4444');  // red-500
+    const labelY = makeAxisLabel('Y', '#22c55e');  // green-500
+    const labelZ = makeAxisLabel('Z', '#3b82f6');  // blue-500
+    labelX.position.set(1.2, 0, 0);
+    labelY.position.set(0, 1.2, 0);
+    labelZ.position.set(0, 0, 1.2);
+    gizmoScene.add(labelX, labelY, labelZ);
+
+    // v25: gizmo 토글 상태는 클로저 변수로 (showAxesGizmo prop에서 매번 읽음)
+    // 기본값 ON (요구사항: 기본값 ON)
 
     // ─── Lights (v1 style — 부드러운 보라톤 + 형상 굴곡 잘 보임) ───
     scene.add(new THREE.AmbientLight(0xffffff, 0.55));
@@ -927,7 +975,41 @@ function ModelViewer({ part, viewMode, showReferenceCube, onAnalysisUpdate }) {
     const animate = () => {
       if (!mounted) return;
       controls.update();
+
+      // 1) 메인 scene 렌더링 (전체 viewport)
+      renderer.clear();
+      renderer.setViewport(0, 0, container.clientWidth, container.clientHeight);
       renderer.render(scene, camera);
+
+      // 2) v25: Axes Gizmo 렌더링 (좌측 하단 작은 영역)
+      // 메인 카메라의 회전(quaternion)만 gizmo 카메라에 복사
+      // → 모델 회전·panning과 무관하게 카메라 방향만 따라감
+      // → 견적·BBox·100mm 큐브와 완전히 분리된 별도 viewport
+      // v27: XYZ 축 위치 — 좌측 하단 메타카드(FILE/DIMENSIONS/VOLUME) 위쪽 빈 영역
+      //   v26: 우측 상단(PART 01 박스 아래)
+      //   v27: 좌측 하단으로 이동 (사용자 요청)
+      //   - 좌측 padding 16px
+      //   - 하단 메타카드 위쪽으로 띄움: y = 메타카드 높이 약 80 + 여유 16 = 96
+      //   - 모델·BBox·100mm 큐브와 별도 viewport라 절대 안 겹침
+      {
+        const gizmoSize = 88;
+        const padding = 16;
+        const bottomOffset = 96;  // 하단 메타카드 위쪽으로 띄움
+        const w = container.clientWidth;
+        const h = container.clientHeight;
+        // setViewport: (x, y, width, height) — y는 화면 하단 기준
+        const gx = padding;                          // 좌측 padding
+        const gy = bottomOffset;                     // 메타카드 위쪽
+        renderer.clearDepth();
+        renderer.setViewport(gx, gy, gizmoSize, gizmoSize);
+        renderer.setScissor(gx, gy, gizmoSize, gizmoSize);
+        renderer.setScissorTest(true);
+        gizmoCamera.position.copy(camera.position).sub(controls.target).normalize().multiplyScalar(5);
+        gizmoCamera.lookAt(0, 0, 0);
+        renderer.render(gizmoScene, gizmoCamera);
+        renderer.setScissorTest(false);
+      }
+
       stateRef.current.frameId = requestAnimationFrame(animate);
     };
     animate();
@@ -955,6 +1037,15 @@ function ModelViewer({ part, viewMode, showReferenceCube, onAnalysisUpdate }) {
       grid.material?.dispose?.();
       plateGeo.dispose();
       plateMat.dispose();
+
+      // v25: gizmo 정리
+      gizmoAxes.geometry?.dispose?.();
+      gizmoAxes.material?.dispose?.();
+      [labelX, labelY, labelZ].forEach((s) => {
+        s.material?.map?.dispose?.();
+        s.material?.dispose?.();
+      });
+
       renderer.dispose();
       if (renderer.domElement.parentNode === container) container.removeChild(renderer.domElement);
     };
@@ -1016,6 +1107,7 @@ function InstantQuotePage() {
 
   const [viewMode, setViewMode] = useState('solid'); // solid | transparent (와이어 제거)
   const [showReferenceCube, setShowReferenceCube] = useState(false);  // v21: 100mm 기준 큐브 토글
+  // v26: showAxesGizmo state 제거 — XYZ 축은 항상 고정 표시
   const [isDragOver, setIsDragOver] = useState(false);
   const [fileSizeError, setFileSizeError] = useState(null);
   const [stlCheckModalState, setStlCheckModalState] = useState({ open: false, partId: null });
@@ -1039,7 +1131,9 @@ function InstantQuotePage() {
 
   const showToast = (msg, type = 'info') => {
     setToast({ msg, type });
-    setTimeout(() => setToast(null), 2400);
+    // v26: warning은 안내문이라 더 오래 노출 (사용자가 읽을 시간 필요)
+    const duration = type === 'warning' ? 4500 : 2400;
+    setTimeout(() => setToast(null), duration);
   };
 
   /* 선택된 파트 */
@@ -1208,10 +1302,24 @@ function InstantQuotePage() {
   };
 
   /* ─── 모든 파트 일괄 견적 ─── */
+  // v26: 재료 미선택 파트가 있으면 산출 중단 + 안내 (요구사항)
+  //      이유: 재료 없는 파트는 견적 0원으로 합산되어 영업 약속 오류 위험
   const handleCalculateAll = () => {
-    parts.forEach((p) => {
-      if (p.status === 'ready') handleCalculatePart(p.id);
-    });
+    const readyParts = parts.filter((p) => p.status === 'ready');
+    const missingMaterial = readyParts.filter((p) => !p.material);
+
+    if (missingMaterial.length > 0) {
+      // 첫 미선택 파트로 자동 이동해서 사용자가 바로 조치할 수 있게
+      setSelectedPartId(missingMaterial[0].id);
+      showToast(
+        '재료가 선택되지 않은 파트가 있습니다. 모든 파트의 재료를 선택한 후 견적을 산출해 주세요.',
+        'warning'
+      );
+      return;
+    }
+
+    // 모든 ready 파트에 재료가 있으면 정상 산출
+    readyParts.forEach((p) => handleCalculatePart(p.id));
     showToast('모든 파트 견적이 산출되었습니다', 'success');
   };
 
@@ -1420,7 +1528,7 @@ function InstantQuotePage() {
                         <div className="inline-flex bg-white/95 backdrop-blur-sm rounded-lg p-1 shadow-md border border-gluck-border">
                           {[
                             { id: 'solid', label: '일반' },
-                            { id: 'transparent', label: '투명' },
+                            { id: 'transparent', label: '투명 view' },
                           ].map((m) => (
                             <button
                               key={m.id}
@@ -1449,8 +1557,10 @@ function InstantQuotePage() {
                           <span className={`inline-block w-2.5 h-2.5 border-2 rounded-sm ${
                             showReferenceCube ? 'border-white bg-white/30' : 'border-gluck-blue bg-gluck-blue/15'
                           }`} />
-                          100mm 기준
+                          스케일 비교(100mm)
                         </button>
+
+                        {/* v26: XYZ 축 토글 제거 — 항상 고정 표시로 변경 (우측 상단 패널) */}
                       </div>
 
                       {/* 분석중 또는 뷰어 */}
@@ -1564,8 +1674,9 @@ function InstantQuotePage() {
                         <span>
                           외형 크기 기준 박스 · 업로드한 모델의 최대 가로·세로·높이 / 바닥 grid · 1 cell ≈ 10mm
                           {showReferenceCube && (
-                            <span className="ml-1 text-gluck-blue font-semibold"> / 파란 큐브 · 100mm 기준 (견적 미포함)</span>
+                            <span className="ml-1 text-gluck-blue font-semibold"> / 파란 큐브 · 스케일 비교(100mm) (견적 미포함)</span>
                           )}
+                          {/* v26: XYZ 축 안내 문구 제거 (요구사항) */}
                         </span>
                       </div>
                       {selectedPart.status === 'ready' && selectedPart.analysis && (
@@ -1666,15 +1777,27 @@ function InstantQuotePage() {
                       <span className="text-gluck-blue ml-2 text-[13px] tnum">({parts.length})</span>
                     </h2>
                   </div>
-                  {!allCalculated && parts.some((p) => p.status === 'ready') && (
-                    <button
-                      onClick={handleCalculateAll}
-                      className="px-4 h-9 bg-gluck-dark-3 text-white rounded-lg text-[12.5px] font-semibold hover:bg-gluck-dark-2 transition-colors flex items-center gap-1.5"
-                    >
-                      모든 파트 견적 일괄 산출
-                      <Icon name="arrow" className="w-3.5 h-3.5" />
-                    </button>
-                  )}
+                  {!allCalculated && parts.some((p) => p.status === 'ready') && (() => {
+                    const readyParts = parts.filter((p) => p.status === 'ready');
+                    const missingCount = readyParts.filter((p) => !p.material).length;
+                    const hasMissing = missingCount > 0;
+                    return (
+                      <button
+                        onClick={handleCalculateAll}
+                        title={hasMissing
+                          ? `재료가 선택되지 않은 파트 ${missingCount}개 있습니다. 클릭 시 안내가 표시됩니다.`
+                          : '모든 파트의 견적을 한 번에 산출합니다.'}
+                        className={`px-4 h-9 rounded-lg text-[12.5px] font-semibold transition-colors flex items-center gap-1.5 ${
+                          hasMissing
+                            ? 'bg-amber-500/15 text-amber-700 border border-amber-300 hover:bg-amber-500/25'
+                            : 'bg-gluck-dark-3 text-white hover:bg-gluck-dark-2'
+                        }`}
+                      >
+                        모든 파트 견적 일괄 산출
+                        <Icon name="arrow" className="w-3.5 h-3.5" />
+                      </button>
+                    );
+                  })()}
                 </div>
 
                 <div className="overflow-hidden bg-white border border-gluck-border rounded-xl">
@@ -1861,7 +1984,7 @@ function InstantQuotePage() {
             <p className="font-extrabold text-gluck-dark-3 tracking-[0.08em] text-[14px] mb-1">GLUCK</p>
             <p>산업용 SLA 3D프린팅 기반 디지털 파운드리</p>
           </div>
-          <p className="uppercase tracking-[0.1em] text-[10.5px]">v24 · Phase 6 (Real Geometry Analysis)</p>
+          <p className="uppercase tracking-[0.1em] text-[10.5px]">v27 · Phase 6.3 (Axes Position Fix)</p>
         </div>
       </footer>
 
@@ -1948,8 +2071,11 @@ function InstantQuotePage() {
 
       {/* TOAST */}
       {toast && (
-        <div className={`fixed bottom-8 left-1/2 -translate-x-1/2 px-5 py-3 rounded-lg text-[13.5px] font-medium text-white shadow-lg z-[200] animate-[slideUp_0.25s_ease] ${
-          toast.type === 'success' ? 'bg-emerald-600' : toast.type === 'error' ? 'bg-red-600' : 'bg-gluck-dark-3'
+        <div className={`fixed bottom-8 left-1/2 -translate-x-1/2 px-5 py-3 rounded-lg text-[13.5px] font-medium text-white shadow-lg z-[200] animate-[slideUp_0.25s_ease] max-w-[90vw] ${
+          toast.type === 'success' ? 'bg-emerald-600' :
+          toast.type === 'error' ? 'bg-red-600' :
+          toast.type === 'warning' ? 'bg-amber-500' :
+          'bg-gluck-dark-3'
         }`}>
           {toast.msg}
         </div>
