@@ -34,6 +34,7 @@
   @keyframes slideUp { from { opacity: 0; transform: translate(-50%, 12px); } to { opacity: 1; transform: translate(-50%, 0); } }
   @keyframes scaleIn { from { opacity: 0; transform: scale(0.96); } to { opacity: 1; transform: scale(1); } }
   @keyframes slideInLeft { from { opacity: 0; transform: translateX(-8px); } to { opacity: 1; transform: translateX(0); } }
+  @keyframes slideInRight { from { opacity: 0; transform: translateX(8px); } to { opacity: 1; transform: translateX(0); } }
 </style>
 
 <script src="https://cdn.tailwindcss.com"></script>
@@ -142,6 +143,172 @@ const Icon = ({ name, className = "w-4 h-4", strokeWidth = 2 }) => {
  *   G40-GW (화이트): 550원/cm³
  *   G10-BR (범용):  500원/cm³
  */
+/* ─── GLUCK 속비우기 기준 (v31 — 글룩 실측 로직 도입) ───
+ * @gluck-verified
+ *
+ * 글룩 백엔드 trimesh 함수 calculate_hollow_volume 로직을 프론트엔드에서 근사 구현.
+ * - vertex normal 방향으로 wall_thickness만큼 안쪽으로 평행 이동시켜 내벽 메시 생성
+ * - 내벽 부피 vs 외부 부피 차이 = 절감 부피
+ * - 안전 하한: 외부 부피의 5%
+ *
+ * 글룩 백엔드 trimesh와의 차이:
+ * - 프론트엔드는 vertex normal만 사용 (trimesh의 mesh.vertex_normals와 거의 동일)
+ * - trimesh의 fix_normals / fill_holes 보정 단계가 없음
+ * - 큐브형 평면 메시는 모서리 vertex normal이 대각선 방향이라 절감률이 백엔드보다 약간 작게 나올 수 있음
+ *   → 백엔드 운영 시작되면 자동 교체 예정 (현재는 근사값)
+ *
+ * 절감률 표시: confidence 등급으로 표시 (수치 직접 표시 금지)
+ *   - 5% 이상 ≤ 10% 미만: "예상 절감 medium"
+ *   - 10% 이상:           "예상 절감 high"
+ */
+const HOLLOW_RATIO_THRESHOLD = 0.05;     // 5% 이상 절감 가능해야 hollow 판정 (글룩 실측)
+const HOLLOW_CONFIDENCE_HIGH = 0.10;     // 10% 이상이면 confidence high (글룩 실측)
+const HOLLOW_DEFAULT_WALL_MM = 2.0;      // 기본 벽 두께 2T (글룩 표준)
+const HOLLOW_FALLBACK_RATIO = 0.30;      // 실패 시 30% 추정 (글룩 실측)
+
+/* ⚠️ v30 호환성 유지용 — 기존 코드에서 참조하는 상수
+ * v31부터는 calculateHollowVolume() 함수를 사용해 형상별 정확한 절감량 계산
+ * HOLLOW_MIN_VOLUME_MM3는 절대 부피 기준 → v31에서는 saving_ratio 기준으로 대체
+ */
+const HOLLOW_MIN_VOLUME_MM3 = 50000;     // (deprecated, v32에서 제거 예정)
+const HOLLOW_STANDARD_WALL_MM = 2.0;     // (호환성)
+const HOLLOW_SAVING_FACTOR = 0.65;       // (호환성 — calculateHollowVolume이 우선)
+
+/* 파트가 속비우기 적용 가능한지 판정 */
+/* ─── v31: 글룩 trimesh 로직의 프론트엔드 근사 구현 ───
+ *
+ * Python trimesh 원본:
+ *   inner_mesh.vertices = mesh.vertices - mesh.vertex_normals * wall_thickness
+ *   hollow_volume = original_volume - abs(inner_mesh.volume)
+ *   return max(hollow_volume, original_volume * 0.05)
+ *
+ * Three.js BufferGeometry로 동일 구현:
+ *   1. computeVertexNormals()로 vertex별 normal 계산 (trimesh의 vertex_normals와 동일)
+ *   2. 각 vertex를 normal 반대 방향으로 wall_thickness만큼 이동
+ *   3. 새 메시의 부피를 Gauss divergence theorem으로 계산
+ *   4. 외부 - 내부 = 절감 부피
+ *   5. 최소 외부 부피의 5% 보장 (글룩 안전 하한)
+ *
+ * @param geometry THREE.BufferGeometry (원본, 변형 안 함)
+ * @param wallThickness 벽 두께 (mm), 기본 2.0
+ * @returns 절감 시뮬레이션 결과 객체
+ */
+function calculateHollowVolume(geometry, wallThickness = HOLLOW_DEFAULT_WALL_MM) {
+  try {
+    // vertex normal 보장 (없으면 계산)
+    if (!geometry.attributes.normal) {
+      geometry.computeVertexNormals();
+    }
+    const positions = geometry.attributes.position.array;
+    const normals = geometry.attributes.normal.array;
+    const indices = geometry.index ? geometry.index.array : null;
+    const vertexCount = positions.length / 3;
+
+    // 1) 원본 부피 (Gauss divergence theorem)
+    const computeVolume = (posArr) => {
+      let signedVolume = 0;
+      const faceCount = indices ? indices.length / 3 : posArr.length / 9;
+      for (let f = 0; f < faceCount; f++) {
+        let i0, i1, i2;
+        if (indices) {
+          i0 = indices[f * 3]; i1 = indices[f * 3 + 1]; i2 = indices[f * 3 + 2];
+        } else {
+          i0 = f * 3; i1 = f * 3 + 1; i2 = f * 3 + 2;
+        }
+        const v0x = posArr[i0 * 3], v0y = posArr[i0 * 3 + 1], v0z = posArr[i0 * 3 + 2];
+        const v1x = posArr[i1 * 3], v1y = posArr[i1 * 3 + 1], v1z = posArr[i1 * 3 + 2];
+        const v2x = posArr[i2 * 3], v2y = posArr[i2 * 3 + 1], v2z = posArr[i2 * 3 + 2];
+        signedVolume += (
+          v0x * (v1y * v2z - v1z * v2y) +
+          v0y * (v1z * v2x - v1x * v2z) +
+          v0z * (v1x * v2y - v1y * v2x)
+        ) / 6;
+      }
+      return Math.abs(signedVolume);
+    };
+
+    const originalVolume = computeVolume(positions);
+
+    // 2) 내벽 vertex 좌표 = 원본 - normal × wallThickness
+    //    (trimesh의 mesh.vertices - mesh.vertex_normals * wall_thickness 와 동일)
+    const innerPositions = new Float32Array(positions.length);
+    for (let v = 0; v < vertexCount; v++) {
+      innerPositions[v * 3]     = positions[v * 3]     - normals[v * 3]     * wallThickness;
+      innerPositions[v * 3 + 1] = positions[v * 3 + 1] - normals[v * 3 + 1] * wallThickness;
+      innerPositions[v * 3 + 2] = positions[v * 3 + 2] - normals[v * 3 + 2] * wallThickness;
+    }
+
+    // 3) 내벽 부피
+    const innerVolume = computeVolume(innerPositions);
+
+    // 4) 절감 부피 = 외부 - 내부
+    const rawHollow = originalVolume - innerVolume;
+
+    // 5) 안전 하한: 최소 외부 부피의 5% (글룩 실측 로직)
+    const hollowVolume = Math.max(rawHollow, originalVolume * HOLLOW_RATIO_THRESHOLD);
+
+    const savingRatio = originalVolume > 0 ? hollowVolume / originalVolume : 0;
+
+    let confidence;
+    if (savingRatio >= HOLLOW_CONFIDENCE_HIGH) confidence = 'high';
+    else if (savingRatio >= HOLLOW_RATIO_THRESHOLD) confidence = 'medium';
+    else confidence = 'low';
+
+    return {
+      originalVolumeMm3: +originalVolume.toFixed(2),
+      innerVolumeMm3: +innerVolume.toFixed(2),
+      hollowVolumeMm3: +hollowVolume.toFixed(2),
+      // 실제 절감 후 효과 부피 = 외부 - 절감 = 내부 (단 5% 하한 적용된 경우 다를 수 있음)
+      effectiveVolumeMm3: +(originalVolume - hollowVolume).toFixed(2),
+      savingRatio: +savingRatio.toFixed(4),
+      confidence,
+      wallThicknessMm: wallThickness,
+      fallbackUsed: false,
+    };
+  } catch (e) {
+    // 글룩 실측 fallback: 30% 추정
+    console.warn('[calculateHollowVolume] 실패 — 30% 추정값 반환:', e);
+    const fallbackVolume = (geometry.userData?.volumeMm3 || 0) * HOLLOW_FALLBACK_RATIO;
+    return {
+      originalVolumeMm3: 0,
+      innerVolumeMm3: null,
+      hollowVolumeMm3: +fallbackVolume.toFixed(2),
+      effectiveVolumeMm3: null,
+      savingRatio: HOLLOW_FALLBACK_RATIO,
+      confidence: 'low',
+      wallThicknessMm: wallThickness,
+      fallbackUsed: true,
+    };
+  }
+}
+
+/* checkHollowEligibility — v31에서 saving_ratio 기준으로 변경
+ * 기존 (v30): 외부 부피 ≥ 50,000mm³ → 사용 (절대 기준)
+ * 현재 (v31): saving_ratio ≥ 5% → 사용 (글룩 실측 로직)
+ *
+ * part.analysis.hollowSimulation 객체가 있어야 정확한 판정 가능.
+ * (calculateHollowVolume 결과를 캐시한 객체)
+ */
+function checkHollowEligibility(part) {
+  if (!part.analysis) return { eligible: false, reason: 'no-analysis' };
+  const hasThinWall = part.analysis.risks?.thinWall;
+  if (hasThinWall) return { eligible: false, reason: 'thin-wall' };
+
+  // v31: hollowSimulation 결과가 있으면 saving_ratio 기준 사용
+  const hs = part.analysis.hollowSimulation;
+  if (hs) {
+    if (hs.savingRatio < HOLLOW_RATIO_THRESHOLD) {
+      return { eligible: false, reason: 'saving-too-low', savingRatio: hs.savingRatio };
+    }
+    return { eligible: true, savingRatio: hs.savingRatio, confidence: hs.confidence };
+  }
+
+  // hollowSimulation이 없으면 (mock 분석 단계) — 임시로 부피 기준 사용 (호환)
+  const vol = part.analysis.volumeMm3 || 0;
+  if (vol < HOLLOW_MIN_VOLUME_MM3) return { eligible: false, reason: 'volume-low', volumeMm3: vol };
+  return { eligible: true };
+}
+
 const MATERIAL_OPTIONS = [
   // v23: 사용자 요청 순서 — 범용 → 고강도 → 화이트 톤
   // 첫 노출 = 영업 우선순위 메시지이므로 사용자 결정 사항
@@ -187,11 +354,23 @@ const MATERIAL_OPTIONS = [
  * @backend-integration
  * 운영 시: 단가는 관리자 페이지에서 CRUD, 변동 즉시 반영
  */
-function calculateQuote({ volumeCm3, materialUnitPrice, quantity, hollowing }) {
+function calculateQuote({ volumeCm3, materialUnitPrice, quantity, hollowing, hollowEffectiveVolumeCm3 }) {
   if (!volumeCm3 || !materialUnitPrice) {
     return { effectiveVolume: 0, unitPrice: 0, totalPrice: 0 };
   }
-  const effectiveVolume = hollowing ? volumeCm3 * 0.65 : volumeCm3;
+  // v31: hollowing 시 form-specific 절감 부피 사용 (글룩 trimesh 로직 근사)
+  //      hollowEffectiveVolumeCm3가 제공되면 그 값 사용, 없으면 호환용 고정 비율 사용
+  let effectiveVolume;
+  if (hollowing) {
+    if (typeof hollowEffectiveVolumeCm3 === 'number' && hollowEffectiveVolumeCm3 > 0) {
+      effectiveVolume = hollowEffectiveVolumeCm3;
+    } else {
+      // 폴백: hollowSimulation 결과가 없는 경우 (mock 분석 단계)
+      effectiveVolume = volumeCm3 * HOLLOW_SAVING_FACTOR;
+    }
+  } else {
+    effectiveVolume = volumeCm3;
+  }
   const unitPrice = Math.round((effectiveVolume * 1.27 * materialUnitPrice) / 1000) * 1000;
   const totalPrice = unitPrice * quantity;
   return { effectiveVolume, unitPrice, totalPrice };
@@ -306,7 +485,12 @@ function analyzeGeometry(geometry) {
   // Hole 검출: boundary edge가 1개 이상이면 open mesh
   // STL은 vertex 중복으로 인해 false positive가 가능 → BufferGeometryUtils.mergeVertices로 사전 정리
   // 현재 코드는 mergeVertices 안 함 → boundary edge 임계값을 약간 높여 false positive 완화
-  const holeDetected = boundaryEdges > 6;  // 6 미만이면 vertex 중복으로 인한 잡음으로 간주
+  // v32: Hole 검출 임계값 완화 (요구사항 6 — 과검출 완화)
+  //   v24: > 6 (기본)
+  //   v32: > 12 — 미세 영역 노이즈성 false positive 줄임
+  //   진짜 구멍은 boundary edge가 보통 수십개 이상 나오므로 12 임계값은 안전
+  //   ⚠️ 운영팀이 글룩 실 STL로 보정 권장
+  const holeDetected = boundaryEdges > 12;
   const nonManifoldDetected = nonManifoldEdges > 0;
 
   // 4) Thin wall 검출 — 간이 휴리스틱
@@ -317,13 +501,18 @@ function analyzeGeometry(geometry) {
   //   얇은 벽 가능성: ratio ≥ 0.8 (vol 대비 면적이 비정상적으로 큼)
   // ⚠️ 정밀 분석 아님 — 백엔드 검토 권장 메시지로 보완
   const ratio = volumeMm3 > 0 ? surfaceMm2 / volumeMm3 : 0;
-  const thinWallSuspected = ratio >= 0.8;
+  // v32: Thin wall 임계값 완화 (요구사항 6 — 과검출 완화)
+  //   v24: ratio >= 0.8 (기본)
+  //   v32: ratio >= 1.0 — 표면적/부피 비율이 매우 높을 때만 검출
+  //   진짜 얇은 부품(예: 얇은 판, 호스)만 잡고, 일반 부품은 통과
+  //   ⚠️ 정밀 측정은 백엔드 trimesh ray-cast 필요 (현재는 휴리스틱)
+  const thinWallSuspected = ratio >= 1.0;
 
   // 5) 빌드 사이즈 (글룩 기준 350×350×300mm) 초과 여부
   const needsSplit = dimX > 350 || dimY > 350 || dimZ > 300;
 
-  // 6) 속비우기 가능 여부
-  const hollowable = volumeCm3 > 30 && !thinWallSuspected;
+  // 6) 속비우기 가능 여부 (v28: 글룩 실무 기준 50,000mm³ 이상 + thin wall 없음)
+  const hollowable = volumeMm3 >= HOLLOW_MIN_VOLUME_MM3 && !thinWallSuspected;
 
   return {
     dim: { x: dimX, y: dimY, z: dimZ },
@@ -370,7 +559,7 @@ function runMockAnalysis(file) {
   };
   const riskCount = Object.values(risks).filter(Boolean).length;
 
-  const hollowable = volumeCm3 > 30 && !risks.thinWall;
+  const hollowable = volumeMm3 >= HOLLOW_MIN_VOLUME_MM3 && !risks.thinWall;
 
   return {
     dim: { x: dimX, y: dimY, z: dimZ },
@@ -429,7 +618,7 @@ function getRiskMessages(analysis) {
 /* ───────────────────────────────────────────
    3D Viewer — 사이즈 박스 + 그리드 + 오류 빨간 하이라이트
    ─────────────────────────────────────────── */
-function ModelViewer({ part, viewMode, showReferenceCube, onAnalysisUpdate }) {
+function ModelViewer({ part, viewMode, referenceCubeSize, onAnalysisUpdate }) {
   const containerRef = useRef(null);
   const stateRef = useRef({});
   // v26: XYZ 축은 항상 고정 표시 (토글 제거)
@@ -539,40 +728,40 @@ function ModelViewer({ part, viewMode, showReferenceCube, onAnalysisUpdate }) {
     // 회전 정렬 단계에서 동적 스케일 적용 (모델 setupMesh 안에서 처리)
     let referenceCube = null;
     let referenceCubeLabel = null;
-    if (showReferenceCube) {
-      // 기본 1.25 단위 큐브 (모델 setupMesh에서 실제 스케일에 맞춰 재조정)
+    if (referenceCubeSize) {
+      // v32: 동적 크기 (100 / 300 / 500 mm 중 선택)
+      // 기본 box geometry는 1.25 단위로 두고, setupMesh에서 실제 모델 스케일에 맞춰 재조정
       const refCubeSize = 1.25;
       const refGeo = new THREE.BoxGeometry(refCubeSize, refCubeSize, refCubeSize);
       const refEdges = new THREE.EdgesGeometry(refGeo);
       referenceCube = new THREE.LineSegments(
         refEdges,
         new THREE.LineBasicMaterial({
-          color: 0x0059FF,        // GLUCK Blue — 시각 분리
+          color: 0x0059FF,        // GLUCK Blue
           transparent: true,
-          opacity: 0.55,
+          opacity: 0.40,           // v32: 더 연하게 (라인만 보이게)
           linewidth: 1,
         })
       );
-      // v24: 그리드 우측 바깥에 배치 — 모델과 겹치지 않도록
       referenceCube.position.set(
-        gridSize / 2 + refCubeSize / 2 + 0.6,    // 그리드 우측 외부
-        refCubeSize / 2,                          // 바닥에 닿게
-        0                                          // 앞뒤 중앙
+        gridSize / 2 + refCubeSize / 2 + 0.6,
+        refCubeSize / 2,
+        0
       );
       gridGroup.add(referenceCube);
 
-      // 살짝 채운 반투명 면 (큐브가 더 명확히 보이도록)
+      // 반투명 면 — 너무 진하지 않게 (요구사항: 모델보다 우선하지 않게)
       const refFillMat = new THREE.MeshBasicMaterial({
         color: 0x0059FF,
         transparent: true,
-        opacity: 0.06,
+        opacity: 0.04,             // v32: 면도 더 연하게
         side: THREE.DoubleSide,
         depthWrite: false,
       });
       const refFill = new THREE.Mesh(refGeo, refFillMat);
       refFill.position.copy(referenceCube.position);
       gridGroup.add(refFill);
-      referenceCubeLabel = refFill;  // 정리용 핸들
+      referenceCubeLabel = refFill;
     }
 
     scene.add(gridGroup);
@@ -598,6 +787,12 @@ function ModelViewer({ part, viewMode, showReferenceCube, onAnalysisUpdate }) {
       if (part.analysis?.analysisLevel !== 'frontend-geometry') {
         try {
           const realAnalysis = analyzeGeometry(geometry);
+
+          // v31: 속비우기 시뮬레이션 — 글룩 trimesh 로직 근사
+          //      현재 geometry는 mm 단위 (원본 좌표). 스케일/이동 전에 실행해야 정확.
+          const hollowSimulation = calculateHollowVolume(geometry, HOLLOW_DEFAULT_WALL_MM);
+          realAnalysis.hollowSimulation = hollowSimulation;
+
           if (onAnalysisUpdate && realAnalysis) {
             onAnalysisUpdate(realAnalysis);
           }
@@ -616,23 +811,20 @@ function ModelViewer({ part, viewMode, showReferenceCube, onAnalysisUpdate }) {
       const scale = 2.5 / maxDim;
       geometry.scale(scale, scale, scale);
 
-      // v21: 100mm 기준 큐브 크기를 모델 분석 dim에 맞춰 재조정
+      // v32: 스케일 비교 큐브 크기 동적 조정 (100/300/500 중 선택값)
       // 분석상 maxDim (mm) → 씬에서 2.5 단위
-      // 100mm → 씬에서 (100 / maxDim_mm) × 2.5 단위
-      if (showReferenceCube && referenceCube && part.analysis?.dim) {
+      // 선택된 size mm → 씬에서 (size / maxDim_mm) × 2.5 단위
+      if (referenceCubeSize && referenceCube && part.analysis?.dim) {
         const dim = part.analysis.dim;
         const maxDimMm = Math.max(dim.x, dim.y, dim.z);
-        const refUnits = (100 / maxDimMm) * 2.5;
+        const refUnits = (referenceCubeSize / maxDimMm) * 2.5;
         const currentSize = 1.25;
         const ratio = refUnits / currentSize;
         referenceCube.scale.setScalar(ratio);
         if (referenceCubeLabel) referenceCubeLabel.scale.setScalar(ratio);
-        // v24: 큐브를 그리드 우측 바깥에 배치 — 모델과 시각적으로 완전히 분리
-        //   - 모델은 그리드 중앙(원점)에 있음
-        //   - 큐브는 그리드 우측 끝(+X) 바깥쪽에 살짝 떨어져서 별도 비교 영역으로 표시
         const newHalf = refUnits / 2;
-        const xPos = gridSize / 2 + newHalf + 0.6;   // 그리드 우측 외부 (모델과 겹치지 않음)
-        const zPos = 0;                                // 그리드 앞뒤 중앙
+        const xPos = gridSize / 2 + newHalf + 0.6;
+        const zPos = 0;
         referenceCube.position.set(xPos, newHalf, zPos);
         if (referenceCubeLabel) referenceCubeLabel.position.set(xPos, newHalf, zPos);
       }
@@ -722,9 +914,24 @@ function ModelViewer({ part, viewMode, showReferenceCube, onAnalysisUpdate }) {
 
           // 닫힌 메시 → boundary edge 0개 → 빨간 표시 안함 (false positive 방지)
           if (boundaryEdges.length === 0) {
-            // 진짜 hole이 없음 → analysis.risks.holes 자동 보정
-            // (UI 표시는 그대로 두되, 시각화만 안함)
-            console.log('[Hole detection] 메시가 닫혀있어 boundary edge 없음 — 빨간 표시 생략');
+            // v30: Stage 1/2 불일치 보정
+            //   Stage 1(vertex index 기반 휴리스틱)이 hole 있다고 판정했어도,
+            //   Stage 2(좌표 기반 정확 분석)에서 boundary edge가 0개면 진짜 닫힌 메시.
+            //   → risks.holes를 false로 보정해서 상태 라벨이 "검토 필요" → "양호"로 변경
+            //   → riskCount도 재계산해서 표·요약 영역 모두 정상으로 갱신
+            //   → 사용자 혼란 제거 + 영업 신뢰도 보호 (false positive 정정)
+            console.log('[Hole detection] Stage 2 좌표 분석 결과 boundary edge 0 — Stage 1 결과 정상으로 보정');
+            if (onAnalysisUpdate && part.analysis?.risks?.holes) {
+              // 가드: 이미 false면 호출 안 함 (무한 루프 방지)
+              const correctedRisks = { ...part.analysis.risks, holes: false };
+              const correctedRiskCount = Object.values(correctedRisks).filter(Boolean).length;
+              onAnalysisUpdate({
+                ...part.analysis,
+                risks: correctedRisks,
+                riskCount: correctedRiskCount,
+                boundaryEdgesCount: 0,    // 정확한 값으로 갱신
+              });
+            }
           } else {
             // ─── 1) Boundary edge를 빨간 선으로 그리기 ───
             const edgeLineVerts = [];
@@ -897,26 +1104,40 @@ function ModelViewer({ part, viewMode, showReferenceCube, onAnalysisUpdate }) {
       bboxLines.position.copy(bbCenter);
       partGroup.add(bboxLines);
 
-      // ─── v20: partGroup 회전 + 바닥 정렬 ───
-      // 1) group에 회전 적용 (모든 자식이 같이 회전)
+      // ─── v32: partGroup 변형 처리 — 회전 + 스케일 + 정렬 (요구사항 4) ───
+      //
+      // 처리 순서 (충돌 방지):
+      //   1) group rotation 적용 (모든 자식 회전)
+      //   2) group scale 적용 (모든 자식 크기 변경)
+      //      → geometry는 원점 중심이라 group.scale을 적용하면 모델 중심 기준으로 커짐
+      //   3) scene 추가 + world matrix 갱신
+      //   4) 변형 후 worldBox 재계산
+      //   5) X/Z 중심 정렬
+      //   6) Y축 바닥 정렬 (모델이 그리드 아래로 안 내려가게)
+      //
+      // 모든 자식(mesh, bbox, hole, thinwall, boundaryEdge)이 partGroup에 묶여있으므로
+      // group 변형 한 번으로 동시 처리됨.
       if (part.rotation) {
         partGroup.rotation.x = (part.rotation.x || 0) * Math.PI / 180;
         partGroup.rotation.y = (part.rotation.y || 0) * Math.PI / 180;
         partGroup.rotation.z = (part.rotation.z || 0) * Math.PI / 180;
       }
-      // 2) scene에 추가 (Box3.setFromObject 호출 전에 필요)
+      // v32: scaleFactor를 partGroup에 적용 — 시각적으로도 실제 크기 변화
+      const sf = part.scaleFactor || 1.0;
+      partGroup.scale.setScalar(sf);
+
       scene.add(partGroup);
       partGroup.updateMatrixWorld(true);
 
-      // 3) 회전 후 world space에서 bounding box 재계산
+      // 변형 후 world space에서 bounding box 재계산
       const worldBox = new THREE.Box3().setFromObject(partGroup);
       const worldCenter = new THREE.Vector3();
       worldBox.getCenter(worldCenter);
 
-      // 4) X/Z 중심 정렬 (원점에 모델 중심이 오도록)
+      // X/Z 중심 정렬 (원점에 모델 중심이 오도록)
       partGroup.position.x -= worldCenter.x;
       partGroup.position.z -= worldCenter.z;
-      // 5) 바닥 정렬: 모델 최하단이 y=0(그리드 면)에 닿도록 보정
+      // 바닥 정렬: 모델 최하단이 y=0(그리드 면)에 닿도록 보정
       partGroup.position.y -= worldBox.min.y;
       partGroup.updateMatrixWorld(true);
 
@@ -925,10 +1146,10 @@ function ModelViewer({ part, viewMode, showReferenceCube, onAnalysisUpdate }) {
       worldBox.getSize(worldSize);
       // v24: 100mm 큐브 표시 시 그리드 우측 외부 영역까지 시야에 포함
       const baseR = Math.max(worldSize.x, worldSize.z) * 1.5 + 3;
-      const r = showReferenceCube ? baseR + 2.5 : baseR;
+      const r = referenceCubeSize ? baseR + 2.5 : baseR;
       camera.position.set(r, worldSize.y * 1.2 + 2, r);
       // 카메라 타겟: 모델 중심 기준. 큐브 활성 시 살짝 +X로 이동해 큐브도 시야 안에
-      const targetX = showReferenceCube ? 1.2 : 0;
+      const targetX = referenceCubeSize ? 1.2 : 0;
       controls.target.set(targetX, worldSize.y / 2, 0);
       controls.update();
     };
@@ -1049,7 +1270,7 @@ function ModelViewer({ part, viewMode, showReferenceCube, onAnalysisUpdate }) {
       renderer.dispose();
       if (renderer.domElement.parentNode === container) container.removeChild(renderer.domElement);
     };
-  }, [part?.id, part?.material?.color, viewMode, part?.analysis?.risks?.holes, part?.analysis?.risks?.thinWall, part?.rotation?.x, part?.rotation?.y, part?.rotation?.z, showReferenceCube]);
+  }, [part?.id, part?.material?.color, viewMode, part?.analysis?.risks?.holes, part?.analysis?.risks?.thinWall, part?.rotation?.x, part?.rotation?.y, part?.rotation?.z, part?.scaleFactor, referenceCubeSize]);
 
   return <div ref={containerRef} className="w-full h-full cursor-grab active:cursor-grabbing" />;
 }
@@ -1106,7 +1327,9 @@ function InstantQuotePage() {
   const [selectedPartId, setSelectedPartId] = useState(null);
 
   const [viewMode, setViewMode] = useState('solid'); // solid | transparent (와이어 제거)
-  const [showReferenceCube, setShowReferenceCube] = useState(false);  // v21: 100mm 기준 큐브 토글
+  // v32: 스케일 비교 — 단일 토글 → 크기 선택형 (100/300/500/OFF)
+  // null = OFF, 숫자 = 표시할 큐브 mm
+  const [referenceCubeSize, setReferenceCubeSize] = useState(null);
   // v26: showAxesGizmo state 제거 — XYZ 축은 항상 고정 표시
   const [isDragOver, setIsDragOver] = useState(false);
   const [fileSizeError, setFileSizeError] = useState(null);
@@ -1291,14 +1514,74 @@ function InstantQuotePage() {
       if (!p.material) return p;
       const scaleFactor = p.scaleFactor || 1.0;
       const scaledVolumeCm3 = p.analysis.volumeCm3 * Math.pow(scaleFactor, 3);
+
+      // v31: hollow simulation이 있으면 형상별 정확한 effective volume 사용
+      let hollowEffectiveVolumeCm3 = null;
+      if (p.hollow && p.analysis.hollowSimulation) {
+        // effectiveVolumeMm3는 원본 좌표계에서 계산된 값 → scaleFactor³로 보정
+        const eff = p.analysis.hollowSimulation.effectiveVolumeMm3;
+        if (typeof eff === 'number' && eff > 0) {
+          hollowEffectiveVolumeCm3 = (eff / 1000) * Math.pow(scaleFactor, 3);
+        }
+      }
+
       const { unitPrice, totalPrice } = calculateQuote({
         volumeCm3: scaledVolumeCm3,
         materialUnitPrice: p.material.unitPrice,
         quantity: p.quantity,
         hollowing: p.hollow,
+        hollowEffectiveVolumeCm3,
       });
       return { ...p, unitPrice, totalPrice };
     }));
+  };
+
+  /* ─── v28: 일괄 속비우기 적용 (글룩 기준 충족 파트만) ─── */
+  const handleApplyHollowAll = () => {
+    const readyParts = parts.filter((p) => p.status === 'ready');
+    if (readyParts.length === 0) {
+      showToast('업로드된 파트가 없습니다.', 'warning');
+      return;
+    }
+
+    let appliedCount = 0;
+    let skippedVolumeLow = 0;
+    let skippedThinWall = 0;
+
+    readyParts.forEach((p) => {
+      const e = checkHollowEligibility(p);
+      if (e.eligible) {
+        if (!p.hollow) {
+          updatePart(p.id, { hollow: true });
+        }
+        appliedCount++;
+      } else if (e.reason === 'volume-low') {
+        skippedVolumeLow++;
+      } else if (e.reason === 'thin-wall') {
+        skippedThinWall++;
+      }
+    });
+
+    // 결과 토스트
+    if (appliedCount === 0) {
+      const reasons = [];
+      if (skippedVolumeLow > 0) reasons.push(`부피 부족 ${skippedVolumeLow}개`);
+      if (skippedThinWall > 0) reasons.push(`얇은 벽 ${skippedThinWall}개`);
+      showToast(
+        `속 비우기 적용 가능한 파트가 없습니다 (${reasons.join(', ')}).`,
+        'warning'
+      );
+    } else if (skippedVolumeLow > 0 || skippedThinWall > 0) {
+      const skipped = [];
+      if (skippedVolumeLow > 0) skipped.push(`부피 부족 ${skippedVolumeLow}개`);
+      if (skippedThinWall > 0) skipped.push(`얇은 벽 ${skippedThinWall}개`);
+      showToast(
+        `${appliedCount}개 파트에 속 비우기 적용 — ${skipped.join(', ')} 제외`,
+        'success'
+      );
+    } else {
+      showToast(`${appliedCount}개 파트에 속 비우기를 적용했습니다.`, 'success');
+    }
   };
 
   /* ─── 모든 파트 일괄 견적 ─── */
@@ -1368,7 +1651,7 @@ function InstantQuotePage() {
       effectiveVolumeCm3: (() => {
         if (!p.analysis?.volumeCm3) return null;
         const scaled = p.analysis.volumeCm3 * Math.pow(p.scaleFactor || 1, 3);
-        return +(p.hollow ? scaled * 0.65 : scaled).toFixed(3);
+        return +(p.hollow ? scaled * HOLLOW_SAVING_FACTOR : scaled).toFixed(3);
       })(),
       scaleFactor: p.scaleFactor || 1.0,
       rotation: p.rotation || { x: 0, y: 0, z: 0 },
@@ -1474,7 +1757,7 @@ function InstantQuotePage() {
               onDragOver={(e) => { e.preventDefault(); setIsDragOver(true); }}
               onDragLeave={() => setIsDragOver(false)}
               onDrop={handleDrop}
-              className={`relative min-h-[440px] m-6 lg:m-8 border-2 border-dashed rounded-2xl flex flex-col items-center justify-center transition-all cursor-pointer group ${
+              className={`relative min-h-[520px] m-6 lg:m-8 border-2 border-dashed rounded-2xl flex flex-col items-center justify-center transition-all cursor-pointer group ${
                 isDragOver
                   ? 'bg-gluck-blue-light/30 border-gluck-blue border-solid'
                   : 'bg-gluck-gray-superlight/60 border-gluck-border hover:bg-white hover:border-gluck-blue'
@@ -1514,6 +1797,7 @@ function InstantQuotePage() {
                 onDuplicate={duplicatePart}
                 onAddMore={() => fileInputRef.current?.click()}
                 onRemoveAll={handleRemoveAll}
+                onApplyHollowAll={handleApplyHollowAll}
               />
               <input type="file" ref={fileInputRef} onChange={handleFileChange} className="hidden" multiple accept=".stl,.obj,.step,.stp,.3mf,.zip" />
 
@@ -1521,46 +1805,65 @@ function InstantQuotePage() {
               <div className="p-6 lg:p-7 border-t lg:border-t-0 lg:border-x border-gluck-border bg-gluck-gray-superlight/30">
                 {selectedPart ? (
                   <>
-                    <div className="relative h-[440px] bg-white rounded-2xl border border-gluck-border overflow-hidden shadow-sm">
+                    <div className="relative h-[520px] bg-white rounded-2xl border border-gluck-border overflow-hidden shadow-sm">
 
-                      {/* View Mode Toggle + 100mm 기준 토글 (좌측 상단 한 줄) */}
-                      <div className="absolute top-4 left-4 z-10 flex items-center gap-2">
-                        <div className="inline-flex bg-white/95 backdrop-blur-sm rounded-lg p-1 shadow-md border border-gluck-border">
-                          {[
-                            { id: 'solid', label: '일반' },
-                            { id: 'transparent', label: '투명 view' },
-                          ].map((m) => (
-                            <button
-                              key={m.id}
-                              onClick={() => setViewMode(m.id)}
-                              className={`px-3.5 py-1.5 rounded-md text-[12px] font-semibold transition-all ${
-                                viewMode === m.id
-                                  ? 'bg-gluck-dark-3 text-white'
-                                  : 'text-gluck-dark hover:text-gluck-dark-2'
-                              }`}
-                            >
-                              {m.label}
-                            </button>
-                          ))}
+                      {/* v34: 좌측 상단 — 옵션 B (라벨 단독 + 버튼 그룹 박스) */}
+                      <div className="absolute top-4 left-4 z-10 flex flex-wrap items-center gap-x-4 gap-y-2">
+                        {/* VIEW: 라벨(박스 밖) + 버튼 그룹(한 박스) */}
+                        <div className="inline-flex items-center gap-1.5">
+                          <span className="text-[9.5px] font-bold text-gluck-dark-2 uppercase tracking-[0.1em] drop-shadow-[0_1px_2px_rgba(255,255,255,0.9)]">
+                            VIEW
+                          </span>
+                          <div className="inline-flex bg-white/95 backdrop-blur-sm rounded-lg p-0.5 shadow-md border border-gluck-border">
+                            {[
+                              { id: 'solid', label: '일반' },
+                              { id: 'transparent', label: '투명' },
+                            ].map((m) => (
+                              <button
+                                key={m.id}
+                                onClick={() => setViewMode(m.id)}
+                                className={`px-2.5 py-1 rounded-md text-[11.5px] font-semibold transition-all ${
+                                  viewMode === m.id
+                                    ? 'bg-gluck-dark-3 text-white'
+                                    : 'text-gluck-dark hover:text-gluck-dark-2'
+                                }`}
+                              >
+                                {m.label}
+                              </button>
+                            ))}
+                          </div>
                         </div>
 
-                        {/* v23: 100mm 기준 큐브 토글 — PART 01 박스와 겹침 방지하려고 좌측으로 이동 */}
-                        <button
-                          onClick={() => setShowReferenceCube(!showReferenceCube)}
-                          className={`inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-[11px] font-semibold transition-all shadow-md border ${
-                            showReferenceCube
-                              ? 'bg-gluck-blue text-white border-gluck-blue'
-                              : 'bg-white/95 backdrop-blur-sm text-gluck-dark-2 border-gluck-border hover:border-gluck-blue/40'
-                          }`}
-                          title="모델 옆에 100mm 큐브를 표시해 크기를 직관적으로 비교합니다. 견적 계산에는 포함되지 않습니다."
-                        >
-                          <span className={`inline-block w-2.5 h-2.5 border-2 rounded-sm ${
-                            showReferenceCube ? 'border-white bg-white/30' : 'border-gluck-blue bg-gluck-blue/15'
-                          }`} />
-                          스케일 비교(100mm)
-                        </button>
-
-                        {/* v26: XYZ 축 토글 제거 — 항상 고정 표시로 변경 (우측 상단 패널) */}
+                        {/* 스케일 비교: 라벨(박스 밖) + 버튼 그룹(한 박스) */}
+                        <div className="inline-flex items-center gap-1.5">
+                          <span
+                            className="text-[9.5px] font-bold text-gluck-dark-2 uppercase tracking-[0.1em] drop-shadow-[0_1px_2px_rgba(255,255,255,0.9)]"
+                            title="견적 계산 미포함"
+                          >
+                            스케일 비교
+                          </span>
+                          <div className="inline-flex bg-white/95 backdrop-blur-sm rounded-lg p-0.5 shadow-md border border-gluck-border">
+                            {[
+                              { value: null, label: 'OFF' },
+                              { value: 100,  label: '100' },
+                              { value: 300,  label: '300' },
+                              { value: 500,  label: '500' },
+                            ].map((o) => (
+                              <button
+                                key={String(o.value)}
+                                onClick={() => setReferenceCubeSize(o.value)}
+                                title={o.value ? `${o.value}mm 큐브 — 견적 계산 미포함` : '스케일 비교 끄기'}
+                                className={`px-2 py-1 rounded-md text-[11px] font-semibold transition-all tnum ${
+                                  referenceCubeSize === o.value
+                                    ? 'bg-gluck-blue text-white'
+                                    : 'text-gluck-dark hover:text-gluck-dark-2'
+                                }`}
+                              >
+                                {o.label}
+                              </button>
+                            ))}
+                          </div>
+                        </div>
                       </div>
 
                       {/* 분석중 또는 뷰어 */}
@@ -1579,16 +1882,22 @@ function InstantQuotePage() {
                         <ModelViewer
                           part={selectedPart}
                           viewMode={viewMode}
-                          showReferenceCube={showReferenceCube}
+                          referenceCubeSize={referenceCubeSize}
                           onAnalysisUpdate={(realAnalysis) => {
                             // v24: 진짜 geometry 분석 결과로 mock 분석값 교체
-                            // 견적도 자동 재계산 (옵션 변경 시 unitPrice 무효화 정책 유지)
-                            updatePart(selectedPart.id, (p) => ({
-                              ...p,
-                              analysis: { ...p.analysis, ...realAnalysis },
-                              unitPrice: 0,
-                              totalPrice: 0,
-                            }));
+                            // v30: Stage 2 hole 보정은 DfM 정정일 뿐이므로 견적 유지
+                            //      (부피·재료·수량 미변경 → 견적 무효화 불필요)
+                            //      vs 최초 mock→실제 교체는 부피가 변하므로 견적 무효화 유지
+                            updatePart(selectedPart.id, (p) => {
+                              const isFirstRealAnalysis = p.analysis?.analysisLevel !== 'frontend-geometry';
+                              const merged = { ...p.analysis, ...realAnalysis };
+                              if (isFirstRealAnalysis) {
+                                // 최초 실제 분석 — 부피 변경 가능성 → 견적 무효화
+                                return { ...p, analysis: merged, unitPrice: 0, totalPrice: 0 };
+                              }
+                              // 이후 DfM 보정만 — 견적 유지
+                              return { ...p, analysis: merged };
+                            });
                           }}
                         />
                       )}
@@ -1645,94 +1954,164 @@ function InstantQuotePage() {
                               {selectedPart.analysis.analysisLevel === 'frontend-mock' && (
                                 <span className="ml-1 text-amber-500" title="분석 중...">●</span>
                               )}
+                              {selectedPart.hollow && selectedPart.analysis.hollowSimulation && (
+                                <span className="ml-1 text-gluck-blue font-bold tnum" title="속 비우기 적용된 부피">속비움 적용</span>
+                              )}
                             </div>
                             <p className="text-[11px] font-semibold text-gluck-dark-3 tnum">
                               {(() => {
+                                // v31: mm³ 단독 표시 + 속비우기 활성 시 effective volume 사용
                                 const sf = selectedPart.scaleFactor || 1;
-                                const v = selectedPart.analysis.volumeMm3 * Math.pow(sf, 3);
-                                const vCm3 = v / 1000;
-                                return `${Math.round(v).toLocaleString()} mm³ · ${vCm3.toFixed(2)} cm³`;
+                                const sf3 = Math.pow(sf, 3);
+                                const originalV = selectedPart.analysis.volumeMm3 * sf3;
+
+                                if (selectedPart.hollow && selectedPart.analysis.hollowSimulation) {
+                                  const hs = selectedPart.analysis.hollowSimulation;
+                                  // effectiveVolumeMm3는 원본 좌표 → scale 보정
+                                  const effV = (hs.effectiveVolumeMm3 || 0) * sf3;
+                                  return `${Math.round(effV).toLocaleString()} mm³`;
+                                }
+                                return `${Math.round(originalV).toLocaleString()} mm³`;
                               })()}
                             </p>
                           </div>
                         </div>
                       )}
 
-                      {/* 회전 안내 */}
+                      {/* v41: ROTATE 라벨 삭제 (사용자 요청) */}
+
+                      {/* v41: 모델 조정 floating 패널 — 우측 상단 PART 박스 아래
+                              위치: top-16 right-4 (PART 박스 바로 아래)
+                              펼침: 위→아래 dropdown 형태 */}
                       {selectedPart.status === 'ready' && (
-                        <div className="absolute top-1/2 right-4 -translate-y-1/2 z-10 inline-flex items-center gap-1.5 bg-gluck-dark-3/70 backdrop-blur-md text-white/85 text-[10px] font-semibold px-3 py-1.5 rounded-full pointer-events-none tracking-[0.12em] uppercase">
-                          <Icon name="rotate" className="w-3 h-3" strokeWidth={2} />
-                          ROTATE
+                        <div className="absolute top-16 right-4 z-10">
+                          <ModelAdjustFloatingPanel
+                            part={selectedPart}
+                            onUpdate={(updates) => updatePart(selectedPart.id, updates)}
+                          />
                         </div>
                       )}
                     </div>
 
-                    {/* 뷰어 하단 안내 */}
-                    <div className="mt-4 flex items-center justify-between gap-3 text-[11.5px] text-gluck-dark flex-wrap">
-                      <div className="flex items-center gap-2">
-                        <Icon name="cube" className="w-3.5 h-3.5 text-gluck-gray" />
-                        <span>
-                          외형 크기 기준 박스 · 업로드한 모델의 최대 가로·세로·높이 / 바닥 grid · 1 cell ≈ 10mm
-                          {showReferenceCube && (
-                            <span className="ml-1 text-gluck-blue font-semibold"> / 파란 큐브 · 스케일 비교(100mm) (견적 미포함)</span>
-                          )}
-                          {/* v26: XYZ 축 안내 문구 제거 (요구사항) */}
-                        </span>
+                    {/* v32: 뷰어 하단 설명 문구 삭제 (요구사항 11)
+                            오류 범례는 12번에서 "제조성 검토 알림" 카드로 이전 예정 */}
+                    {selectedPart.status === 'ready' && selectedPart.analysis && (
+                      <div className="mt-4 flex items-center justify-end gap-3 text-[11.5px] text-gluck-dark flex-wrap">
+                        {selectedPart.analysis.risks?.holes && (
+                          <span className="inline-flex items-center gap-1.5 text-red-600">
+                            <span className="w-3 h-3 bg-red-500/55 border border-red-500 rounded-sm" />
+                            빨간 영역 · 뚫린 면(Hole)
+                          </span>
+                        )}
+                        {selectedPart.analysis.risks?.thinWall && (
+                          <span className="inline-flex items-center gap-1.5 text-blue-600">
+                            <span className="w-3 h-3 bg-blue-500/40 border border-blue-500 rounded-sm" />
+                            파랑 영역 · 얇은 벽 (≤1.0mm)
+                          </span>
+                        )}
                       </div>
-                      {selectedPart.status === 'ready' && selectedPart.analysis && (
-                        <div className="flex items-center gap-3">
-                          {selectedPart.analysis.risks?.holes && (
-                            <span className="inline-flex items-center gap-1.5 text-red-600">
-                              <span className="w-3 h-3 bg-red-500/55 border border-red-500 rounded-sm" />
-                              빨간 영역 · 뚫린 면(Hole)
+                    )}
+
+                    {/* v32: 제조성 검토 알림 — 통합 카드 (요구사항 12)
+                            기존 Hole / Thin Wall / Non-manifold 3개 분산 안내를 한 카드로 통합
+                            오류 유형별 색상 구분 + 정상 상태도 표시 */}
+                    {selectedPart.status === 'ready' && selectedPart.analysis && (() => {
+                      const r = selectedPart.analysis.risks || {};
+                      const hasAnyRisk = r.holes || r.thinWall || r.nonManifold;
+                      const isSplit = selectedPart.analysis.needsSplit;
+
+                      return (
+                        <div className="mt-3 border border-gluck-border rounded-lg overflow-hidden bg-white animate-[fadeIn_0.3s_ease]">
+                          {/* 카드 헤더 */}
+                          <div className={`px-3.5 py-2.5 flex items-center justify-between border-b border-gluck-border/60 ${
+                            hasAnyRisk ? 'bg-amber-50/50' : 'bg-emerald-50/50'
+                          }`}>
+                            <div className="flex items-center gap-2">
+                              <Icon
+                                name={hasAnyRisk ? 'alert' : 'check'}
+                                className={`w-3.5 h-3.5 ${hasAnyRisk ? 'text-amber-600' : 'text-emerald-600'}`}
+                                strokeWidth={2.2}
+                              />
+                              <span className="text-[12px] font-semibold text-gluck-dark-3">
+                                제조성 검토 알림
+                              </span>
+                            </div>
+                            <span className={`text-[10.5px] font-semibold px-2 py-0.5 rounded ${
+                              hasAnyRisk ? 'bg-amber-100 text-amber-800' : 'bg-emerald-100 text-emerald-800'
+                            }`}>
+                              {hasAnyRisk ? '검토 필요' : '정상'}
                             </span>
-                          )}
-                          {selectedPart.analysis.risks?.thinWall && (
-                            <span className="inline-flex items-center gap-1.5 text-blue-600">
-                              <span className="w-3 h-3 bg-blue-500/40 border border-blue-500 rounded-sm" />
-                              파랑 영역 · 얇은 벽 (≤1.0mm)
-                            </span>
-                          )}
+                          </div>
+
+                          {/* 카드 본문 */}
+                          <div className="px-3.5 py-3 space-y-2">
+                            {!hasAnyRisk && (
+                              <p className="text-[11.5px] text-gluck-dark-2 leading-[1.65]">
+                                현재 자동 검사 기준에서 주요 오류가 감지되지 않았습니다.
+                              </p>
+                            )}
+
+                            {r.holes && (
+                              <div className="flex items-start gap-2.5">
+                                <span className="inline-block w-2 h-2 rounded-full bg-red-500 mt-1.5 shrink-0" />
+                                <div className="flex-1 min-w-0">
+                                  <p className="text-[11.5px] font-semibold text-red-700">Open Mesh / Hole — 검토 필요</p>
+                                  <p className="text-[10.5px] text-gluck-dark mt-0.5 leading-[1.6]">
+                                    열린 경계면 또는 닫히지 않은 메시가 감지되었습니다. 빨간 영역으로 표시됩니다.
+                                  </p>
+                                </div>
+                              </div>
+                            )}
+
+                            {r.thinWall && (
+                              <div className="flex items-start gap-2.5">
+                                <span className="inline-block w-2 h-2 rounded-full bg-blue-500 mt-1.5 shrink-0" />
+                                <div className="flex-1 min-w-0">
+                                  <p className="text-[11.5px] font-semibold text-blue-700">Thin Wall — 검토 필요</p>
+                                  <p className="text-[10.5px] text-gluck-dark mt-0.5 leading-[1.6]">
+                                    1.0mm 이하 얇은 벽 의심 영역이 감지되었습니다. 파란 영역으로 표시됩니다.
+                                  </p>
+                                </div>
+                              </div>
+                            )}
+
+                            {r.nonManifold && (
+                              <div className="flex items-start gap-2.5">
+                                <span className="inline-block w-2 h-2 rounded-full bg-amber-500 mt-1.5 shrink-0" />
+                                <div className="flex-1 min-w-0">
+                                  <p className="text-[11.5px] font-semibold text-amber-700">Non-manifold 메시 — 검토 필요</p>
+                                  <p className="text-[10.5px] text-gluck-dark mt-0.5 leading-[1.6]">
+                                    3개 이상의 면이 한 모서리에 연결된 구간이 감지되었습니다. STL 정리 후 재업로드를 권장합니다.
+                                  </p>
+                                </div>
+                              </div>
+                            )}
+
+                            {isSplit && (
+                              <div className="flex items-start gap-2.5">
+                                <span className="inline-block w-2 h-2 rounded-full bg-purple-500 mt-1.5 shrink-0" />
+                                <div className="flex-1 min-w-0">
+                                  <p className="text-[11.5px] font-semibold text-purple-700">빌드 사이즈 초과 — 분할 필요</p>
+                                  <p className="text-[10.5px] text-gluck-dark mt-0.5 leading-[1.6]">
+                                    글룩 빌드 사이즈(350 × 350 × 300 mm)를 초과해 분할 출력이 필요합니다.
+                                  </p>
+                                </div>
+                              </div>
+                            )}
+
+                            {hasAnyRisk && (
+                              <p className="text-[10px] text-gluck-dark pt-1.5 border-t border-gluck-border/60 leading-[1.6]">
+                                자동 검사는 출력 전 사전 검토를 돕기 위한 예상 결과입니다.
+                                미세 영역은 정식 파일 검토 과정에서 최종 확인됩니다.
+                              </p>
+                            )}
+                          </div>
                         </div>
-                      )}
-                    </div>
-
-                    {/* Open Mesh/Hole 검출 안내 (요구사항 4) — 빨간 영역이 있을 때만 노출 */}
-                    {selectedPart.status === 'ready' && selectedPart.analysis?.risks?.holes && (
-                      <div className="mt-3 p-3 bg-red-50 border border-red-200 rounded-lg flex gap-2.5 animate-[fadeIn_0.3s_ease]">
-                        <Icon name="info" className="w-3.5 h-3.5 text-red-500 shrink-0 mt-0.5" strokeWidth={2.2} />
-                        <p className="text-[11.5px] text-red-900 leading-[1.65]">
-                          <strong className="font-semibold">Open Mesh / Hole</strong> — 열린 경계면 또는 닫히지 않은 메시가 감지되었습니다.
-                          실시간 검사는 자동 분석 결과이며, 정식 제조 검토에서 재확인됩니다.
-                        </p>
-                      </div>
-                    )}
-
-                    {/* Thin Wall 검출 안내 (요구사항 10) — 파란 영역이 있을 때만 노출 */}
-                    {selectedPart.status === 'ready' && selectedPart.analysis?.risks?.thinWall && (
-                      <div className="mt-2 p-3 bg-blue-50 border border-blue-200 rounded-lg flex gap-2.5 animate-[fadeIn_0.3s_ease]">
-                        <Icon name="info" className="w-3.5 h-3.5 text-blue-500 shrink-0 mt-0.5" strokeWidth={2.2} />
-                        <p className="text-[11.5px] text-blue-900 leading-[1.65]">
-                          <strong className="font-semibold">Thin Wall 가능성</strong> — 표면적 대비 부피 비율이 높아
-                          1.0mm 이하 영역이 있을 가능성이 있습니다.
-                          정확한 두께 분석은 정식 견적 검토 단계에서 GLUCK 엔지니어 검토로 확정됩니다.
-                        </p>
-                      </div>
-                    )}
-
-                    {/* Non-manifold 안내 (v24 신규) */}
-                    {selectedPart.status === 'ready' && selectedPart.analysis?.risks?.nonManifold && (
-                      <div className="mt-2 p-3 bg-amber-50 border border-amber-200 rounded-lg flex gap-2.5 animate-[fadeIn_0.3s_ease]">
-                        <Icon name="alert" className="w-3.5 h-3.5 text-amber-500 shrink-0 mt-0.5" strokeWidth={2.2} />
-                        <p className="text-[11.5px] text-amber-900 leading-[1.65]">
-                          <strong className="font-semibold">Non-manifold 메시</strong> — 3개 이상의 면이 한 모서리에 연결된 구간이 감지되었습니다.
-                          STL 정리 후 재업로드를 권장합니다.
-                        </p>
-                      </div>
-                    )}
+                      );
+                    })()}
                   </>
                 ) : (
-                  <div className="h-[440px] flex items-center justify-center text-gluck-dark text-[13px]">
+                  <div className="h-[520px] flex items-center justify-center text-gluck-dark text-[13px]">
                     좌측 Parts에서 파트를 선택해주세요
                   </div>
                 )}
@@ -1777,31 +2156,41 @@ function InstantQuotePage() {
                       <span className="text-gluck-blue ml-2 text-[13px] tnum">({parts.length})</span>
                     </h2>
                   </div>
-                  {!allCalculated && parts.some((p) => p.status === 'ready') && (() => {
-                    const readyParts = parts.filter((p) => p.status === 'ready');
-                    const missingCount = readyParts.filter((p) => !p.material).length;
-                    const hasMissing = missingCount > 0;
-                    return (
-                      <button
-                        onClick={handleCalculateAll}
-                        title={hasMissing
-                          ? `재료가 선택되지 않은 파트 ${missingCount}개 있습니다. 클릭 시 안내가 표시됩니다.`
-                          : '모든 파트의 견적을 한 번에 산출합니다.'}
-                        className={`px-4 h-9 rounded-lg text-[12.5px] font-semibold transition-colors flex items-center gap-1.5 ${
-                          hasMissing
-                            ? 'bg-amber-500/15 text-amber-700 border border-amber-300 hover:bg-amber-500/25'
-                            : 'bg-gluck-dark-3 text-white hover:bg-gluck-dark-2'
-                        }`}
-                      >
-                        모든 파트 견적 일괄 산출
-                        <Icon name="arrow" className="w-3.5 h-3.5" />
-                      </button>
-                    );
-                  })()}
+                  {parts.some((p) => p.status === 'ready') && (
+                    <div className="flex items-center gap-2">
+                      {/* v29: 일괄 속비우기 버튼은 PARTS 사이드바 상단으로 이동됨 */}
+
+                      {/* 일괄 견적 산출 */}
+                      {!allCalculated && (() => {
+                        const readyParts = parts.filter((p) => p.status === 'ready');
+                        const missingCount = readyParts.filter((p) => !p.material).length;
+                        const hasMissing = missingCount > 0;
+                        return (
+                          <button
+                            onClick={handleCalculateAll}
+                            title={hasMissing
+                              ? `재료가 선택되지 않은 파트 ${missingCount}개 있습니다. 클릭 시 안내가 표시됩니다.`
+                              : '모든 파트의 견적을 한 번에 산출합니다.'}
+                            className={`px-4 h-9 rounded-lg text-[12.5px] font-semibold transition-colors flex items-center gap-1.5 ${
+                              hasMissing
+                                ? 'bg-amber-500/15 text-amber-700 border border-amber-300 hover:bg-amber-500/25'
+                                : 'bg-gluck-dark-3 text-white hover:bg-gluck-dark-2'
+                            }`}
+                          >
+                            모든 파트 견적 일괄 산출
+                            <Icon name="arrow" className="w-3.5 h-3.5" />
+                          </button>
+                        );
+                      })()}
+                    </div>
+                  )}
                 </div>
 
-                <div className="overflow-hidden bg-white border border-gluck-border rounded-xl">
-                  <table className="w-full border-collapse">
+                {/* v32: 프로젝트 요약 — 파트 많을 때 내부 스크롤 (요구사항 8)
+                        합계 행은 테이블 안에 두되, 파트 5개 이상이면 본문만 스크롤되도록 max-height */}
+                <div className="bg-white border border-gluck-border rounded-xl overflow-hidden">
+                  <div className={parts.length > 5 ? 'max-h-[400px] overflow-y-auto' : ''}>
+                    <table className="w-full border-collapse">
                     <thead className="bg-gluck-gray-superlight/70 border-b border-gluck-border">
                       <tr className="text-[11.5px] font-semibold text-gluck-dark">
                         <th className="px-4 py-3.5 text-left">파트</th>
@@ -1892,46 +2281,38 @@ function InstantQuotePage() {
                         </tr>
                       ))}
 
-                      {/* ── 합계 행 (모든 파트 견적 산출 완료 시 활성화) ── */}
-                      {allCalculated && (
-                        <tr className="bg-gluck-gray-superlight/60 border-t-2 border-gluck-dark-3 animate-[fadeIn_0.3s_ease]">
-                          <td colSpan={2} className="px-4 py-4">
-                            <div className="flex items-center gap-2">
-                              <Icon name="layers" className="w-4 h-4 text-gluck-blue" strokeWidth={2.2} />
-                              <span className="text-[12.5px] font-bold text-gluck-dark-3 tracking-[-0.005em]">
-                                프로젝트 합계
-                              </span>
-                              <span className="text-[10.5px] text-gluck-dark tnum">
-                                · {projectTotal.partCount}개 파트 · 예상 납기 {projectTotal.leadDays}일
-                              </span>
-                            </div>
-                          </td>
-                          <td className="px-4 py-4" />
-                          <td className="px-4 py-4" />
-                          <td className="px-4 py-4 text-[13px] font-bold text-gluck-dark-3 tnum">
-                            {projectTotal.totalQty.toLocaleString()}
-                          </td>
-                          <td className="px-4 py-4 text-right">
-                            <p className="text-[18px] font-extrabold text-gluck-blue tnum tracking-[-0.015em]">
-                              ₩{projectTotal.sum.toLocaleString()}
-                            </p>
-                          </td>
-                        </tr>
-                      )}
+                      {/* v32: 합계 행은 테이블 밖으로 이전 (요구사항 8) */}
+                      {/* v32: 합계 행은 테이블 밖 별도 영역으로 분리 (요구사항 8: 항상 보임)
+                              아래에 별도 영역으로 렌더링 */}
                     </tbody>
                   </table>
+                  </div>
+                  {/* v32: 합계 영역 — 스크롤과 무관하게 항상 표시 */}
+                  {allCalculated && (
+                    <div className="bg-gluck-blue-light/25 border-t border-gluck-border px-5 py-4 flex items-center justify-between flex-wrap gap-3 animate-[fadeIn_0.3s_ease]">
+                      <div className="flex items-center gap-2">
+                        <Icon name="layers" className="w-4 h-4 text-gluck-blue" strokeWidth={2.2} />
+                        <span className="text-[12.5px] font-bold text-gluck-dark-3 tracking-[-0.005em]">
+                          프로젝트 합계
+                        </span>
+                        <span className="text-[10.5px] text-gluck-dark tnum">
+                          · {projectTotal.partCount}개 파트 · 총 {projectTotal.totalQty.toLocaleString()}개
+                        </span>
+                      </div>
+                      <p className="text-[18px] font-extrabold text-gluck-blue tnum tracking-[-0.015em]">
+                        ₩{projectTotal.sum.toLocaleString()}
+                      </p>
+                    </div>
+                  )}
                 </div>
 
-                {/* ── 합계 산출 후 단순 CTA + 면책조항 한 줄 ── */}
+                {/* v35: 합계 산출 후 CTA + 양산단가 안내 (블루 톤 통일) */}
                 {allCalculated && (
                   <div className="mt-4 flex items-center justify-between gap-4 flex-wrap animate-[fadeIn_0.3s_ease]">
-                    <div className="flex items-start gap-2 text-[11px] text-gluck-dark leading-[1.6] flex-1 min-w-[280px]">
-                      <Icon name="alert" className="w-3 h-3 text-gluck-gray shrink-0 mt-0.5" />
+                    <div className="flex items-start gap-2 text-[11.5px] leading-[1.6] flex-1 min-w-[280px] text-gluck-blue font-semibold">
+                      <Icon name="factory" className="w-3.5 h-3.5 shrink-0 mt-0.5 text-gluck-blue" strokeWidth={2.2} />
                       <span>
-                        추정치이며 ±5% 오차가 발생할 수 있습니다. 정식 견적은 글룩 엔지니어 검토 후 확정됩니다.
-                        {projectTotal.totalQty >= 100 && (
-                          <span className="ml-1 text-gluck-blue font-semibold">총 {projectTotal.totalQty.toLocaleString()}개 — 양산 단가 상담 권장.</span>
-                        )}
+                        대량생산 시 양산 단가 최적화가 가능하며, 정식 견적 요청 후 안내드립니다.
                       </span>
                     </div>
                     <button className="h-11 px-6 bg-gluck-blue text-white rounded-lg font-semibold text-[13.5px] hover:bg-gluck-blue-tone-up active:bg-gluck-blue-tone-down transition-colors flex items-center gap-2 group shrink-0">
@@ -1984,7 +2365,7 @@ function InstantQuotePage() {
             <p className="font-extrabold text-gluck-dark-3 tracking-[0.08em] text-[14px] mb-1">GLUCK</p>
             <p>산업용 SLA 3D프린팅 기반 디지털 파운드리</p>
           </div>
-          <p className="uppercase tracking-[0.1em] text-[10.5px]">v27 · Phase 6.3 (Axes Position Fix)</p>
+          <p className="uppercase tracking-[0.1em] text-[10.5px]">v43 · Phase 9.11 (Viewer Height 440 → 520)</p>
         </div>
       </footer>
 
@@ -2088,9 +2469,16 @@ function InstantQuotePage() {
 /* ═══════════════════════════════════════
    PartsSidebar
    ═══════════════════════════════════════ */
-function PartsSidebar({ parts, selectedPartId, onSelect, onRemove, onDuplicate, onAddMore, onRemoveAll }) {
+function PartsSidebar({ parts, selectedPartId, onSelect, onRemove, onDuplicate, onAddMore, onRemoveAll, onApplyHollowAll }) {
+  // v29: 일괄 속비우기 적용 가능 여부 계산
+  const eligibleParts = parts.filter((p) =>
+    p.status === 'ready' && checkHollowEligibility(p).eligible
+  );
+  const eligibleCount = eligibleParts.length;
+  const allEligibleHollow = eligibleCount > 0 && eligibleParts.every((p) => p.hollow);
+
   return (
-    <div className="bg-white p-4 lg:p-5 lg:border-r border-gluck-border min-h-[440px]">
+    <div className="bg-white p-4 lg:p-5 lg:border-r border-gluck-border min-h-[520px]">
       <div className="flex items-center justify-between mb-3">
         <div className="flex items-center gap-2">
           <Icon name="layers" className="w-3.5 h-3.5 text-gluck-blue" strokeWidth={2.2} />
@@ -2107,7 +2495,34 @@ function PartsSidebar({ parts, selectedPartId, onSelect, onRemove, onDuplicate, 
         )}
       </div>
 
-      <div className="space-y-1.5">
+      {/* v29: 모든 파트에 일괄 속비움 적용 버튼 (사용자 결정 위치) */}
+      {eligibleCount > 0 && (
+        <button
+          onClick={onApplyHollowAll}
+          disabled={allEligibleHollow}
+          title={allEligibleHollow
+            ? '적용 가능한 파트는 모두 속 비우기가 적용되어 있습니다.'
+            : `적용 가능한 파트 ${eligibleCount}개에 속 비우기를 일괄 적용합니다.`}
+          className={`w-full mb-3 px-3 py-2 rounded-lg text-[11.5px] font-semibold transition-colors flex items-center justify-center gap-1.5 border ${
+            allEligibleHollow
+              ? 'bg-gluck-gray-superlight text-gluck-gray border-gluck-border cursor-not-allowed'
+              : 'bg-gluck-blue-light/30 text-gluck-blue border-gluck-blue/30 hover:bg-gluck-blue-light/60'
+          }`}
+        >
+          <Icon name="package" className="w-3.5 h-3.5" />
+          {allEligibleHollow
+            ? '속 비우기 적용 완료'
+            : `모든 파트 일괄 속비움 (${eligibleCount}개)`}
+        </button>
+      )}
+
+      {/* v32: 파트 리스트 — 최대 높이 + 내부 스크롤 (요구사항 7)
+              파트가 많아져도 페이지 전체가 길어지지 않음 */}
+      <div className="space-y-1.5 max-h-[420px] overflow-y-auto pr-1 -mr-1
+                       [&::-webkit-scrollbar]:w-1.5
+                       [&::-webkit-scrollbar-thumb]:bg-gluck-border
+                       [&::-webkit-scrollbar-thumb]:rounded-full
+                       [&::-webkit-scrollbar-track]:bg-transparent">
         {parts.map((p) => (
           <div
             key={p.id}
@@ -2365,6 +2780,145 @@ function MaterialTooltip({ anchorRef, material, visible }) {
 }
 
 /* ═══════════════════════════════════════
+   v32: ModelAdjustFloatingPanel — 3D 뷰어 내부 모델 조정 패널
+   - 스케일 + 모델 방향 통합
+   - 기본 접힘, 클릭 시 펼침
+   - 모델을 가리지 않도록 반투명·우측 상단
+   ═══════════════════════════════════════ */
+function ModelAdjustFloatingPanel({ part, onUpdate }) {
+  const [open, setOpen] = useState(false);
+  const scaleFactor = part.scaleFactor || 1.0;
+  const scalePercent = Math.round(scaleFactor * 100);
+  const rotation = part.rotation || { x: 0, y: 0, z: 0 };
+  const hasScaleChange = scaleFactor !== 1.0;
+  const hasRotChange = rotation.x !== 0 || rotation.y !== 0 || rotation.z !== 0;
+  const hasAnyChange = hasScaleChange || hasRotChange;
+
+  // 하나의 컨테이너로 통합 — 헤더와 본문이 같은 background·border 공유
+  return (
+    <div className="w-[260px] bg-white/97 backdrop-blur-md border border-gluck-border rounded-xl shadow-[0_4px_16px_-2px_rgba(15,18,28,0.12)] overflow-hidden">
+      {/* ─── 헤더 (트리거) ─── */}
+      <button
+        onClick={() => setOpen(!open)}
+        className="w-full flex items-center justify-between gap-2 px-3.5 py-2.5 hover:bg-gluck-gray-superlight/40 transition-colors"
+      >
+        <div className="flex items-center gap-2 min-w-0">
+          <Icon name="settings" className="w-3.5 h-3.5 text-gluck-dark-2 shrink-0" strokeWidth={2} />
+          <span className="text-[11.5px] font-semibold text-gluck-dark-3 tracking-[-0.005em]">모델 조정</span>
+          {hasAnyChange && (
+            <span className="inline-block w-1.5 h-1.5 rounded-full bg-gluck-blue shrink-0" title="변경 사항 있음" />
+          )}
+        </div>
+        <Icon
+          name="chevronDown"
+          className={`w-3.5 h-3.5 text-gluck-dark shrink-0 transition-transform ${open ? 'rotate-180' : ''}`}
+          strokeWidth={2}
+        />
+      </button>
+
+      {/* ─── 접힌 상태 요약 ─── */}
+      {!open && (
+        <div className="px-3.5 pb-2.5 -mt-1">
+          <div className="text-[10.5px] text-gluck-dark tnum flex items-center justify-between gap-2 pt-1.5 border-t border-gluck-border/50">
+            <span>
+              스케일 <span className={hasScaleChange ? 'font-semibold text-gluck-blue' : 'text-gluck-dark-2'}>{scalePercent}%</span>
+            </span>
+            <span className="text-gluck-gray">·</span>
+            <span>
+              방향 <span className={hasRotChange ? 'font-semibold text-gluck-blue' : 'text-gluck-dark-2'}>
+                {rotation.x}°/{rotation.y}°/{rotation.z}°
+              </span>
+            </span>
+          </div>
+        </div>
+      )}
+
+      {/* ─── 펼친 상태 ─── */}
+      {open && (
+        <div className="border-t border-gluck-border/60 animate-[fadeIn_0.18s_ease]">
+          {/* 초기화 버튼 영역 */}
+          {hasAnyChange && (
+            <div className="px-4 py-2 border-b border-gluck-border/60 flex items-center justify-end">
+              <button
+                onClick={() => onUpdate({ scaleFactor: 1.0, rotation: { x: 0, y: 0, z: 0 } })}
+                className="text-[10px] font-semibold text-gluck-dark hover:text-gluck-blue transition-colors"
+                title="전체 초기화"
+              >
+                초기화
+              </button>
+            </div>
+          )}
+
+          {/* 스케일 */}
+          <div className="px-4 py-3 border-b border-gluck-border/60">
+            <div className="flex items-center justify-between mb-2">
+              <span className="text-[9.5px] font-bold text-gluck-dark uppercase tracking-[0.1em]">스케일</span>
+              <span className={`text-[11px] font-bold tnum ${hasScaleChange ? 'text-gluck-blue' : 'text-gluck-dark-3'}`}>
+                {scalePercent}%
+              </span>
+            </div>
+            <input
+              type="range"
+              min={50}
+              max={300}
+              step={1}
+              value={scalePercent}
+              onChange={(e) => onUpdate({ scaleFactor: parseInt(e.target.value) / 100 })}
+              className="w-full h-1 mb-2.5"
+              style={{ accentColor: '#0059FF' }}
+            />
+            <div className="flex gap-1">
+              {[50, 100, 200, 300].map((p) => (
+                <button
+                  key={p}
+                  onClick={() => onUpdate({ scaleFactor: p / 100 })}
+                  className={`flex-1 h-7 rounded-md text-[10px] font-semibold tnum transition-all ${
+                    scalePercent === p
+                      ? 'bg-gluck-blue text-white shadow-[0_2px_6px_rgba(0,89,255,0.3)]'
+                      : 'bg-white border border-gluck-border text-gluck-dark-2 hover:border-gluck-blue/40 hover:text-gluck-blue'
+                  }`}
+                >
+                  {p}
+                </button>
+              ))}
+            </div>
+          </div>
+
+          {/* 방향 */}
+          <div className="px-4 py-3">
+            <div className="mb-2">
+              <span className="text-[9.5px] font-bold text-gluck-dark uppercase tracking-[0.1em]">방향 X / Y / Z</span>
+            </div>
+            <div className="space-y-1">
+              {['x', 'y', 'z'].map((axis) => (
+                <div key={axis} className="flex items-center gap-1.5">
+                  <span className="w-3.5 text-[10px] font-bold uppercase text-gluck-dark-2 tnum">{axis}</span>
+                  <div className="flex gap-1 flex-1">
+                    {[0, 90, 180, 270].map((deg) => (
+                      <button
+                        key={deg}
+                        onClick={() => onUpdate({ rotation: { ...rotation, [axis]: deg } })}
+                        className={`flex-1 h-7 rounded-md text-[10px] font-semibold tnum transition-all ${
+                          rotation[axis] === deg
+                            ? 'bg-gluck-blue text-white shadow-[0_2px_6px_rgba(0,89,255,0.3)]'
+                            : 'bg-white border border-gluck-border text-gluck-dark-2 hover:border-gluck-blue/40 hover:text-gluck-blue'
+                        }`}
+                      >
+                        {deg}°
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              ))}
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+/* ═══════════════════════════════════════
    ScaleControl — 파트별 스케일 조정 (v19 Phase 2 / 요구사항 1)
    ═══════════════════════════════════════ */
 function ScaleControl({ part, onUpdate }) {
@@ -2500,7 +3054,10 @@ function ScaleControl({ part, onUpdate }) {
               {scaledVolume !== null && (
                 <div className="flex justify-between mt-0.5">
                   <span>부피:</span>
-                  <span className="text-gluck-dark-2 font-semibold">{scaledVolume.toLocaleString()} cm³</span>
+                  <span className="text-gluck-dark-2 font-semibold tnum">
+                    {/* v31: cm³ → mm³ 통일 */}
+                    {Math.round(scaledVolume * 1000).toLocaleString()} mm³
+                  </span>
                 </div>
               )}
             </div>
@@ -2727,46 +3284,48 @@ function PartOptionsPanel({ part, materialDropdownOpen, setMaterialDropdownOpen,
             <Icon name="plus" className="w-3.5 h-3.5" />
           </button>
         </div>
-        {part.quantity >= 2 && (
-          <div className={`mt-2 px-2.5 py-1.5 rounded-md flex items-start gap-1.5 transition-colors ${
-            part.quantity >= 100
-              ? 'bg-gluck-blue-light/40 border border-gluck-blue/15'
-              : 'bg-gluck-gray-superlight/80 border border-gluck-border'
-          }`}>
-            <Icon
-              name="factory"
-              className={`w-3 h-3 shrink-0 mt-0.5 ${part.quantity >= 100 ? 'text-gluck-blue' : 'text-gluck-dark'}`}
-            />
-            <p className={`text-[10.5px] leading-relaxed ${part.quantity >= 100 ? 'text-gluck-dark-2' : 'text-gluck-dark'}`}>
-              {part.quantity >= 100
-                ? '100개 이상 — 양산 단가 상담 권장'
-                : '100개 이상부터 양산 전용 단가가 적용될 수 있습니다.'}
-            </p>
-          </div>
-        )}
-      </div>
-
-      {/* 속 비우기 */}
-      <div className="mb-5">
-        <div className="flex items-start justify-between gap-3 px-3 py-2.5 bg-white border border-gluck-border rounded-lg">
-          <div>
-            <p className="text-[12px] font-semibold text-gluck-dark-2 mb-0.5">속 비우기 적용</p>
-            <p className="text-[10.5px] text-gluck-dark leading-relaxed">
-              내부 비워 재료비 절감 (~35%)
-            </p>
-          </div>
-          <button
-            onClick={() => onUpdate({ hollow: !part.hollow })}
-            className={`shrink-0 w-11 h-6 rounded-full transition-colors relative ${
-              part.hollow ? 'bg-gluck-blue' : 'bg-gluck-gray-light'
-            }`}
-          >
-            <span className={`absolute top-0.5 w-5 h-5 bg-white rounded-full shadow-sm transition-all ${
-              part.hollow ? 'left-[22px]' : 'left-0.5'
-            }`} />
-          </button>
+        {/* v41: 양산단가 안내 — 줄바꿈 깨짐 방지 위해 둘째 줄 더 짧게 */}
+        <div className="mt-2.5 px-3 py-2 rounded-lg flex items-start gap-2 bg-gluck-blue-light/35 border border-gluck-blue/25">
+          <Icon name="factory" className="w-3.5 h-3.5 shrink-0 mt-0.5 text-gluck-blue" strokeWidth={2.2} />
+          <p className="text-[11px] leading-[1.55] text-gluck-blue font-semibold">
+            대량생산 시 양산 단가 최적화가 가능합니다.<br />
+            정식 견적 후 안내드립니다.
+          </p>
         </div>
       </div>
+
+      {/* 속 비우기 — v29: 옵션 A (글룩 기준 미충족 파트는 영역 자체 미노출) */}
+      {(() => {
+        const eligibility = checkHollowEligibility(part);
+        // v29 변경: 부적합 파트는 토글 영역을 완전히 숨김 (옵션 A)
+        // - 부피 부족, thin wall 있음, 분석 미완료 → 모두 미노출
+        // - 화면이 깔끔해지고, 사용자가 부적합 항목에 시선 뺏기지 않음
+        if (!eligibility.eligible) return null;
+
+        return (
+          <div className="mb-5">
+            <div className="flex items-start justify-between gap-3 px-3 py-2.5 bg-white border border-gluck-border rounded-lg">
+              <div className="min-w-0">
+                <p className="text-[12px] font-semibold text-gluck-dark-2 mb-0.5">속 비우기 적용</p>
+                <p className="text-[10.5px] text-gluck-dark leading-relaxed">
+                  내부를 비워 재료비를 절감합니다.<br />
+                  <span className="text-gluck-dark-2/80">2T 벽두께 · 예상 절감</span>
+                </p>
+              </div>
+              <button
+                onClick={() => onUpdate({ hollow: !part.hollow })}
+                className={`shrink-0 w-11 h-6 rounded-full transition-colors relative ${
+                  part.hollow ? 'bg-gluck-blue' : 'bg-gluck-gray-light'
+                }`}
+              >
+                <span className={`absolute top-0.5 w-5 h-5 bg-white rounded-full shadow-sm transition-all ${
+                  part.hollow ? 'left-[22px]' : 'left-0.5'
+                }`} />
+              </button>
+            </div>
+          </div>
+        );
+      })()}
 
       {/* 견적 계산 + 가격 표시 */}
       <button
@@ -2799,12 +3358,8 @@ function PartOptionsPanel({ part, materialDropdownOpen, setMaterialDropdownOpen,
         </div>
       )}
 
-      {/* ─── v22 Phase 5: 보조 기능 (기본 접힘) ─── */}
-      {/* 스케일·로테이트는 모든 고객이 쓰지 않는 기능이라 견적 버튼 아래에 접힘 상태로 배치 */}
-      <div className="mt-4 space-y-2">
-        <ScaleControl part={part} onUpdate={onUpdate} />
-        <RotateControl part={part} onUpdate={onUpdate} />
-      </div>
+      {/* v32: 스케일·로테이트는 3D 뷰어 내부 floating 패널로 이전 (요구사항 3)
+              옵션 패널은 견적 조건 설정에만 집중 */}
 
       {/* 상세 분석 아코디언 */}
       {part.analysis && status && (
